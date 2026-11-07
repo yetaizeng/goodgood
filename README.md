@@ -12,6 +12,49 @@
 - **外部（松耦合）**：A2A 协议向供应商/物流 Agent 委派任务（库存查询、补货、物流跟踪），回执验签 + 幂等 + 超时补偿。
 - **工具层（标准化）**：MCP（FastMCP）封装读写分级工具，只读工具无门槛，写工具需内部授权。
 
+### 系统架构
+
+```mermaid
+flowchart TB
+    subgraph Client["客户端"]
+        WEB["前端演示页面<br/>(static/index.html)"]
+    end
+
+    subgraph Internal["内部 · 紧耦合（LangGraph 编排）"]
+        ORCH["Orchestrator<br/>意图路由"]
+        P["商品 Agent"]
+        O["订单 Agent"]
+        S["客服 Agent"]
+        M["营销 Agent"]
+        CK["Checkpoint<br/>(共享 state)"]
+    end
+
+    subgraph External["外部 · 松耦合（A2A 委派）"]
+        SUP["供应商 Agent<br/>(A2A Server)"]
+        LOG["物流 Agent<br/>(A2A Server)"]
+    end
+
+    subgraph Tools["工具层 · MCP 标准化"]
+        MCP["MCP 工具层<br/>读写分级"]
+    end
+
+    subgraph Store["存储 / LLM"]
+        SQLITE[("SQLite<br/>商品/订单/评论")]
+        LLM["MockLLM / RealLLM<br/>(LLM_PROVIDER 切换)"]
+    end
+
+    WEB -->|"SSE 请求"| ORCH
+    ORCH -->|"条件路由"| P & O & S & M
+    P & O & S & M --> CK
+    ORCH -.->|"需外部数据时"| SUP & LOG
+    SUP & LOG -.->|"回执验签"| ORCH
+    P & O & S & M --> MCP
+    MCP --> SQLITE
+    P & O & S & M --> LLM
+```
+
+> 架构说明：内部 4 个 Agent 通过 LangGraph 共享 state（紧耦合）；对外通过 A2A 协议与供应商/物流 Agent 松耦合协作；所有数据访问经 MCP 工具层（读写分级）；LLM 通过 `LLM_PROVIDER` 在 MockLLM 与真实模型间切换。
+
 ### 核心亮点（面试可讲）
 
 | 维度 | 设计 |
@@ -192,6 +235,25 @@ export LLM_BASE_URL=http://127.0.0.1:11434
 - **服务端**（`app/interop/a2a_agents.py` + `a2a_server.py`）：供应商/物流 Agent 通过官方 `a2a-sdk` 实现 `AgentExecutor`，暴露 `/.well-known/agent-card.json`（Agent Card 能力发现）+ JSON-RPC 消息接口。
 - **客户端**（`app/interop/a2a_delegate.py` 的 `A2AClientDelegator`）：通过 `ClientFactory` 发现 Agent Card 并委派任务，解析 `task.status` 回执。
 - **任务状态流转**：submitted → working → completed（回执以 JSON 文本携带在 `task.status.message.parts`）。
+
+#### A2A 委派时序
+
+```mermaid
+sequenceDiagram
+    participant 内部 as 内部编排层<br/>(Orchestrator)
+    participant Client as A2A Client<br/>(A2AClientDelegator)
+    participant Server as 外部 Agent<br/>(A2A Server)
+
+    内部->>Client: 委派任务（字段白名单 + 幂等键）
+    Client->>Server: 发现 Agent Card<br/>/.well-known/agent-card.json
+    Server-->>Client: 返回 AgentCard（能力/接口）
+    Client->>Server: send_message（JSON-RPC）
+    Server-->>Client: enqueue Task（submitted）
+    Server-->>Client: TaskStatusUpdate（working）
+    Server-->>Client: TaskStatusUpdate（completed + 回执 JSON）
+    Client-->>内部: 解析 task.status 回执
+    内部->>内部: 验签 + 记录双侧审计
+```
 
 ### 演示完整闭环
 
